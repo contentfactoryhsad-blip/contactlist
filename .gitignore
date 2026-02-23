@@ -1,0 +1,11 @@
+.auth/
+.env
+node_modules/
+.next/
+dist/
+.DS_Store
+credentials/
+__pycache__/
+*.pyc
+.vercel
+.streamlit/secrets.toml
