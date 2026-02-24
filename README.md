@@ -59,8 +59,10 @@ SMTP_FROM=your_sender_email
 ```env
 ADMIN_PASSWORD=your_admin_password
 SITE_PASSWORD=your_site_password
+DISABLE_PORTAL_PASSWORD=true
 ```
 `SITE_PASSWORD` is optional. If empty, the app is publicly accessible and only admin actions require `ADMIN_PASSWORD`.
+If you deploy on Streamlit Cloud, prefer Cloud access control and set `DISABLE_PORTAL_PASSWORD=true` (or omit `SITE_PASSWORD`).
 
 ## Run Streamlit
 ```bash

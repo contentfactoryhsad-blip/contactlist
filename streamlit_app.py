@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import hashlib
 import html
 import hmac
@@ -11,19 +12,22 @@ from typing import Any
 from urllib.parse import urlencode
 
 import streamlit as st
+import extra_streamlit_components as stx
 
 from streamlit_backend import (
     build_excel_bytes,
     get_mailer,
     get_site_password,
     get_store,
+    is_totp_valid,
     is_admin_password_valid,
+    is_admin_totp_valid,
     is_site_password_valid,
 )
 
 st.set_page_config(page_title="LGE Creative Hub", page_icon="🧭", layout="wide")
 
-SESSION_TTL_SECONDS = 60 * 60
+SESSION_TTL_SECONDS = 60 * 60 * 10  # 10 hours
 
 PAGE_CONFIG: dict[str, dict[str, str]] = {
     "home": {"label": "Home"},
@@ -38,6 +42,82 @@ def init_services():
     store = get_store()
     mailer = get_mailer(store)
     return store, mailer
+
+cookies = stx.CookieManager()
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padded = value + "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def _auth_signing_key() -> bytes:
+    # Separate secret for cookie signing; fall back to site password if not set.
+    raw = (os.getenv("AUTH_COOKIE_SECRET") or get_site_password() or "").encode("utf-8")
+    # Even if the password is short, hashing makes key length consistent for HMAC.
+    return hashlib.sha256(raw).digest()
+
+
+def _make_auth_token(payload: dict[str, Any]) -> str:
+    body = _b64url(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    sig = hmac.new(_auth_signing_key(), body.encode("utf-8"), hashlib.sha256).digest()
+    return f"{body}.{_b64url(sig)}"
+
+
+def _verify_auth_token(token: str) -> dict[str, Any] | None:
+    try:
+        body, sig = token.split(".", 1)
+        expected = hmac.new(_auth_signing_key(), body.encode("utf-8"), hashlib.sha256).digest()
+        got = _b64url_decode(sig)
+        if not hmac.compare_digest(expected, got):
+            return None
+        payload = json.loads(_b64url_decode(body).decode("utf-8"))
+        exp = int(payload.get("exp", 0) or 0)
+        if exp and int(datetime.now(timezone.utc).timestamp()) > exp:
+            return None
+        return payload
+    except Exception:
+        return None
+
+
+def _set_cookie(kind: str, payload: dict[str, Any]) -> None:
+    token = _make_auth_token(payload)
+    # exp is inside the signed token; use a long enough cookie lifespan.
+    cookies.set(kind, token, expires_at=None)
+
+
+def _clear_cookie(kind: str) -> None:
+    cookies.delete(kind)
+
+
+def apply_cookie_auth() -> None:
+    # Cookie-based auth persists across refresh/new tab. Session state remains authoritative.
+    now = int(datetime.now(timezone.utc).timestamp())
+
+    if not st.session_state.get("site_authed"):
+        token = str(cookies.get("site_auth") or "")
+        payload = _verify_auth_token(token) if token else None
+        if payload and payload.get("kind") == "site" and int(payload.get("exp", 0) or 0) > now:
+            st.session_state.site_authed = True
+
+    if not st.session_state.get("admin_authed"):
+        token = str(cookies.get("admin_auth") or "")
+        payload = _verify_auth_token(token) if token else None
+        if payload and payload.get("kind") == "admin" and int(payload.get("exp", 0) or 0) > now:
+            st.session_state.admin_authed = True
+            st.session_state.admin_email = str(payload.get("email") or "")
+
+
+def portal_password_enabled() -> bool:
+    # Prefer Streamlit Cloud access control over shared passwords.
+    return (
+        bool(get_site_password())
+        and (os.getenv("DISABLE_PORTAL_PASSWORD", "").strip().lower() != "true")
+    )
 
 
 def _mask_value(value: str, keep: int = 8) -> str:
@@ -484,6 +564,90 @@ def show_active_notify_dialog(mailer: Any, record: dict[str, Any]) -> None:
         st.error(f"Notification failed: {err}")
 
 
+
+
+def _totp_provisioning_uri(secret: str, email_label: str = "Admin", issuer: str = "Creative Hub") -> str:
+    try:
+        import pyotp
+
+        totp = pyotp.TOTP(secret)
+        return totp.provisioning_uri(name=email_label, issuer_name=issuer)
+    except Exception:
+        return ""
+
+
+def _totp_qr_png_bytes(uri: str) -> bytes:
+    try:
+        import qrcode
+
+        img = qrcode.make(uri)
+        import io
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:
+        return b""
+
+
+@st.dialog("Admin OTP Setup")
+def show_admin_totp_setup_dialog(store: Any, mailer: Any) -> None:
+    st.markdown("### Two-Factor Authentication (OTP)")
+    st.caption("OTP secrets are stored per-admin in Airtable `AdminUsers` field `OTP Secret`.")
+
+    email = st.text_input("Admin Email", placeholder="name@company.com")
+    if not email.strip():
+        st.info("Enter an admin email to continue.")
+        return
+
+    if not store.is_admin_email(email):
+        st.error("This email is not listed in AdminUsers.")
+        return
+
+    current = (store.get_admin_totp_secret(email) or "").strip()
+
+    if "pending_totp_secret" not in st.session_state:
+        st.session_state.pending_totp_secret = ""
+
+    c1, c2 = st.columns([1, 1], gap="small")
+    with c1:
+        if st.button("Generate New Secret", type="primary"):
+            import pyotp
+
+            st.session_state.pending_totp_secret = pyotp.random_base32()
+    with c2:
+        if current and st.button("Use Existing Secret"):
+            st.session_state.pending_totp_secret = current
+
+    secret = (st.session_state.pending_totp_secret or current or "").strip()
+    if not secret:
+        st.info("No OTP secret exists yet. Generate a new one.")
+        return
+
+    st.code(secret if not current or secret != current else (secret[:4] + "..." + secret[-4:]))
+
+    uri = _totp_provisioning_uri(secret, email_label=email.strip(), issuer="Creative Hub")
+    png = _totp_qr_png_bytes(uri)
+    if png:
+        st.image(png, caption="Scan this QR code in your OTP app", width=260)
+
+    st.markdown("### Verify And Save")
+    code = st.text_input("Verify OTP Code", placeholder="6-digit code", max_chars=6)
+    send_email = st.checkbox("Email me this OTP secret (for confirmation)", value=True)
+
+    if st.button("Save To Airtable", type="primary"):
+        if not is_totp_valid(secret, code):
+            st.error("OTP code is invalid. Check your phone time and try again.")
+            return
+        try:
+            store.set_admin_totp_secret(email, secret)
+            if send_email:
+                mailer.send_admin_otp_enrollment_email(email, secret)
+            st.success("Saved. OTP is now enabled for this admin.")
+            st.rerun()
+        except Exception as err:
+            st.error(f"Failed to save: {err}")
+
 @st.dialog("Delete Active Access")
 def show_active_delete_dialog(store: Any, record: dict[str, Any]) -> None:
     fields = record["fields"]
@@ -524,6 +688,7 @@ def ensure_session_defaults() -> None:
         "site_authed": False,
         "admin_authed": False,
         "admin_password": "",
+        "admin_email": "",
         "my_access_records": [],
         "my_access_selected_id": "",
         "my_access_otp_record_id": "",
@@ -589,30 +754,18 @@ def verify_session_token(kind: str, token: str, secret: str) -> bool:
 
 
 def apply_persistent_auth() -> None:
-    site_secret = get_site_password()
-    site_token = _q_get("site_session", "")
-    if site_secret and verify_session_token("site", site_token, site_secret):
-        st.session_state.site_authed = True
-    elif site_token:
-        _q_set("site_session", None)
-
-    admin_secret = (os.getenv("ADMIN_PASSWORD") or "").strip()
-    admin_token = _q_get("admin_session", "")
-    if admin_secret and verify_session_token("admin", admin_token, admin_secret):
-        st.session_state.admin_authed = True
-        st.session_state.admin_password = admin_secret
-    elif admin_token:
-        _q_set("admin_session", None)
+    # Security: do not persist auth tokens in the URL.
+    # Clear legacy query params if they exist.
+    for key in ("site_session", "admin_session"):
+        try:
+            if key in st.query_params:
+                del st.query_params[key]
+        except Exception:
+            pass
 
 
 def build_page_url(page_key: str) -> str:
     params: dict[str, str] = {"page": page_key}
-    site_token = _q_get("site_session", "")
-    admin_token = _q_get("admin_session", "")
-    if site_token:
-        params["site_session"] = site_token
-    if admin_token:
-        params["admin_session"] = admin_token
     return "?" + urlencode(params)
 
 
@@ -1267,13 +1420,14 @@ def show_site_login(store) -> None:
         if submitted:
             if is_site_password_valid(password):
                 st.session_state.site_authed = True
+                exp = int(datetime.now(timezone.utc).timestamp()) + SESSION_TTL_SECONDS
+                _set_cookie("site_auth", {"kind": "site", "exp": exp})
                 site_secret = get_site_password()
                 if site_secret:
-                    _q_set("site_session", create_session_token("site", site_secret))
-                try:
-                    store.log_login_attempt(result="success", path="streamlit-site-login")
-                except Exception:
-                    pass
+                    try:
+                        store.log_login_attempt(result="success", path="streamlit-site-login")
+                    except Exception:
+                        pass
                 st.rerun()
             else:
                 try:
@@ -1353,17 +1507,20 @@ def show_new_request(store, mailer) -> None:
     regions = sorted({row["Region"] for row in hierarchy})
     region = st.selectbox("Region *", options=regions)
 
-    subsidiaries = sorted({row["Subsidiary"] for row in hierarchy if row["Region"] == region})
-    subsidiary = st.selectbox("Subsidiary *", options=subsidiaries, disabled=not bool(region))
+    # Subsidiary is essentially the branch code; users should select Branch (country/name),
+    # then subsidiary code is auto-mapped from reference hierarchy.
+    region_rows = [row for row in hierarchy if row["Region"] == region]
+    branch_options = sorted({row["Branch"] for row in region_rows})
+    branch = st.selectbox("Branch *", options=branch_options, disabled=not bool(region))
 
-    branches = sorted(
-        {
-            row["Branch"]
-            for row in hierarchy
-            if row["Region"] == region and row["Subsidiary"] == subsidiary
-        }
-    )
-    branch = st.selectbox("Branch *", options=branches, disabled=not bool(subsidiary))
+    branch_to_subsidiary: dict[str, str] = {}
+    for row in region_rows:
+        b = row.get("Branch", "")
+        s = row.get("Subsidiary", "")
+        if b and s and b not in branch_to_subsidiary:
+            branch_to_subsidiary[b] = s
+    subsidiary = branch_to_subsidiary.get(branch, "")
+    st.text_input("Subsidiary (Auto)", value=subsidiary, disabled=True)
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1677,17 +1834,29 @@ def show_admin_dashboard(store, mailer) -> None:
         st.markdown("<h2 style='margin-top:0;'>Admin Access</h2>", unsafe_allow_html=True)
         st.caption("Enter the admin password to access the dashboard.")
         with st.form("admin_unlock_form"):
+            admin_email = st.text_input("Admin Email", placeholder="name@company.com")
             password = st.text_input("Admin Password", type="password")
+            otp_code = st.text_input("OTP Code", placeholder="6-digit code", max_chars=6)
             unlock = st.form_submit_button("Unlock", type="primary")
 
         if unlock:
-            if is_admin_password_valid(password):
+            if not store.is_admin_email(admin_email or ""):
+                st.error("Admin email is not authorized.")
+                return
+
+            # Prefer per-admin secret stored in Airtable; fall back to global ADMIN_TOTP_SECRET if present.
+            secret = (store.get_admin_totp_secret(admin_email) or "").strip()
+            otp_ok = is_totp_valid(secret, otp_code) if secret else is_admin_totp_valid(otp_code)
+
+            if is_admin_password_valid(password) and otp_ok:
                 st.session_state.admin_authed = True
                 st.session_state.admin_password = password
-                _q_set("admin_session", create_session_token("admin", password))
+                st.session_state.admin_email = (admin_email or "").strip()
+                exp = int(datetime.now(timezone.utc).timestamp()) + SESSION_TTL_SECONDS
+                _set_cookie("admin_auth", {"kind": "admin", "exp": exp, "email": st.session_state.admin_email})
                 st.rerun()
             else:
-                st.error("Invalid admin password.")
+                st.error("Invalid admin password or OTP code.")
         return
 
     left_actions, _ = st.columns([2.6, 7.4], gap="small")
@@ -1883,19 +2052,23 @@ def show_admin_dashboard(store, mailer) -> None:
                 except Exception as err:
                     st.error(f"Failed to save settings: {err}")
 
+        st.markdown("---")
+        st.subheader("Admin OTP")
+        st.caption("Enable 2FA for Admin Dashboard using a TOTP app (Google Authenticator/Authy).")
+        if st.button("Open OTP Setup"):
+            show_admin_totp_setup_dialog(store, mailer)
+
+
 
 ensure_session_defaults()
 inject_legacy_theme()
 apply_persistent_auth()
+apply_cookie_auth()
 
 try:
     store, mailer = init_services()
 except Exception as err:
     st.error(f"Failed to initialize app: {err}")
-    st.stop()
-
-if get_site_password() and not st.session_state.site_authed:
-    show_site_login(store)
     st.stop()
 
 page = st.query_params.get("page", "home")
@@ -1904,6 +2077,12 @@ if isinstance(page, list):
 if page not in PAGE_CONFIG:
     page = "home"
     st.query_params["page"] = "home"
+
+# Portal password should protect the main app, but Admin should be reachable directly
+# (admin auth still requires its own password + OTP).
+if portal_password_enabled() and not st.session_state.site_authed and page != "admin":
+    show_site_login(store)
+    st.stop()
 
 render_nav(page)
 

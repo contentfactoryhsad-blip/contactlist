@@ -40,6 +40,19 @@ Important:
 - table names must match Airtable table names exactly
 - SMTP settings must be valid for email automation
 
+## 3.1) Access control (recommended)
+Instead of using a shared `SITE_PASSWORD`, use Streamlit Cloud's built-in access control.
+
+1. In Streamlit Cloud, open your app
+2. Go to `Settings` -> `Sharing`
+3. Set visibility to private (or restricted)
+4. Add allowed viewers by email (your company accounts)
+
+Then disable the portal password gate:
+- Remove `SITE_PASSWORD` from Secrets (or set it to empty)
+or
+- Set `DISABLE_PORTAL_PASSWORD=true` in Secrets
+
 ## 4) Reboot app
 After saving secrets, click `Reboot app`.
 

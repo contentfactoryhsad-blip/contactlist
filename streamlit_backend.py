@@ -74,6 +74,7 @@ class AppConfig:
     smtp_pass: str
     smtp_from: str
     admin_password: str
+    admin_totp_secret: str
     site_password: str
 
     @staticmethod
@@ -112,6 +113,7 @@ class AppConfig:
             smtp_pass=read("SMTP_PASS"),
             smtp_from=read("SMTP_FROM"),
             admin_password=read("ADMIN_PASSWORD"),
+            admin_totp_secret=read("ADMIN_TOTP_SECRET"),
             site_password=site_password,
         )
 
@@ -452,6 +454,7 @@ class AccessStore:
                     "fields": {
                         "Email": _read_field(fields, "Email"),
                         "Role": _read_field(fields, "Role"),
+                        "OtpSecret": _read_field(fields, "OTP Secret"),
                     },
                 }
             )
@@ -460,6 +463,34 @@ class AccessStore:
     def is_admin_email(self, email: str) -> bool:
         target = _normalize_email(email)
         return any(_normalize_email(row["fields"]["Email"]) == target for row in self.list_admin_users())
+
+    def get_admin_user(self, email: str) -> dict[str, Any] | None:
+        target = _normalize_email(email)
+        for row in self.list_admin_users():
+            if _normalize_email(row["fields"].get("Email", "")) == target:
+                return row
+        return None
+
+    def get_admin_totp_secret(self, email: str) -> str:
+        row = self.get_admin_user(email)
+        if not row:
+            return ""
+        return (row.get("fields", {}).get("OtpSecret") or "").strip()
+
+    def set_admin_totp_secret(self, email: str, secret: str) -> None:
+        clean_email = email.strip()
+        clean_secret = secret.strip()
+        if not clean_email:
+            raise RuntimeError("Admin email is required.")
+        if not clean_secret:
+            raise RuntimeError("OTP secret is required.")
+
+        existing = self.get_admin_user(clean_email)
+        fields = {"Email": clean_email, "OTP Secret": clean_secret}
+        if existing and existing.get("id"):
+            self.client.update_record(self.config.tables.admins, str(existing["id"]), fields)
+            return
+        self.client.create_record(self.config.tables.admins, fields)
 
     def get_hierarchy_rows(self) -> list[dict[str, str]]:
         records = self.client.list_all_records(self.config.tables.reference)
@@ -1335,6 +1366,53 @@ class Mailer:
             html_body=html_body,
         )
 
+    def send_admin_otp_enrollment_email(self, admin_email: str, secret: str) -> None:
+        admin_email = (admin_email or "").strip()
+        secret = (secret or "").strip()
+        if not admin_email:
+            raise RuntimeError("Admin email is required.")
+        if not secret:
+            raise RuntimeError("OTP secret is required.")
+
+        settings = self.store.get_admin_settings()
+        sender, admin_contact = self._sender_email(settings)
+
+        uri = ""
+        try:
+            import pyotp
+
+            uri = pyotp.TOTP(secret).provisioning_uri(name=admin_email, issuer_name="Creative Hub")
+        except Exception:
+            uri = ""
+
+        rows = [
+            ("Admin Email", admin_email),
+            ("OTP Secret", secret),
+            ("OTP URI", uri or "-"),
+        ]
+        text_body = self._render_email_text(
+            "Use Google Authenticator (or any OTP app) to add this account.",
+            rows,
+            admin_contact,
+            highlight_label="Security Tip",
+            highlight_value="Keep this secret private. If you suspect it was exposed, rotate it immediately.",
+        )
+        html_body = self._render_email_html(
+            "Admin OTP Setup",
+            "Use Google Authenticator (or any OTP app) to add this account.",
+            rows,
+            admin_contact,
+            highlight_label="Security Tip",
+            highlight_value="Keep this secret private. If you suspect it was exposed, rotate it immediately.",
+        )
+        self._send_mail(
+            admin_email,
+            "Creative Hub | Admin OTP Setup",
+            text_body,
+            reply_to=admin_contact if admin_contact != sender else "",
+            html_body=html_body,
+        )
+
 
 def build_excel_bytes(records: list[dict[str, Any]], mapper: Callable[[dict[str, str]], dict[str, str]]) -> bytes:
     rows = [mapper(record.get("fields", {})) for record in records]
@@ -1353,6 +1431,28 @@ def get_store() -> AccessStore:
 def get_mailer(store: AccessStore | None = None) -> Mailer:
     actual_store = store or get_store()
     return Mailer(actual_store)
+
+def is_totp_valid(secret: str, code: str) -> bool:
+    if not secret:
+        return False
+    try:
+        import pyotp
+
+        value = (code or "").strip().replace(" ", "")
+        if len(value) != 6 or not value.isdigit():
+            return False
+        totp = pyotp.TOTP(secret)
+        # Allow +/- 30s window to handle minor clock drift.
+        return bool(totp.verify(value, valid_window=1))
+    except Exception:
+        return False
+
+
+def is_admin_totp_valid(code: str) -> bool:
+    secret = AppConfig.from_env().admin_totp_secret
+    if not secret:
+        return True
+    return is_totp_valid(secret, code)
 
 
 def is_admin_password_valid(password: str) -> bool:
