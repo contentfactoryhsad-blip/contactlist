@@ -16,6 +16,7 @@ import extra_streamlit_components as stx
 
 from streamlit_backend import (
     build_excel_bytes,
+    check_smtp_connection,
     get_mailer,
     get_site_password,
     get_store,
@@ -196,6 +197,15 @@ def show_airtable_connection_dialog(success: bool, ok_messages: list[str], error
     if error_messages:
         st.caption("Issues")
         st.code("\n".join(error_messages))
+
+
+@st.dialog("Email Connection Check")
+def show_email_connection_dialog(success: bool, message: str) -> None:
+    if success:
+        st.success("SMTP connection is healthy.")
+    else:
+        st.error("SMTP connection check failed.")
+    st.code(message)
 
 
 @st.dialog("New Request Status")
@@ -595,31 +605,41 @@ def show_admin_totp_setup_dialog(store: Any, mailer: Any) -> None:
     st.markdown("### Two-Factor Authentication (OTP)")
     st.caption("OTP secrets are stored per-admin in Airtable `AdminUsers` field `OTP Secret`.")
 
-    email = st.text_input("Admin Email", placeholder="name@company.com")
-    if not email.strip():
-        st.info("Enter an admin email to continue.")
+    admin_rows = store.list_admin_users()
+    admin_emails = sorted(
+        {(row.get("fields", {}).get("Email", "") or "").strip().lower() for row in admin_rows if (row.get("fields", {}).get("Email", "") or "").strip()}
+    )
+    if not admin_emails:
+        st.error("No admin emails found in AdminUsers.")
         return
 
+    email = st.selectbox("Admin Email", options=admin_emails)
     if not store.is_admin_email(email):
         st.error("This email is not listed in AdminUsers.")
         return
 
     current = (store.get_admin_totp_secret(email) or "").strip()
 
-    if "pending_totp_secret" not in st.session_state:
-        st.session_state.pending_totp_secret = ""
+    if "pending_totp_secret_by_email" not in st.session_state:
+        st.session_state.pending_totp_secret_by_email = {}
+
+    pending_map = st.session_state.pending_totp_secret_by_email
+    if not isinstance(pending_map, dict):
+        pending_map = {}
+        st.session_state.pending_totp_secret_by_email = pending_map
 
     c1, c2 = st.columns([1, 1], gap="small")
     with c1:
         if st.button("Generate New Secret", type="primary"):
             import pyotp
 
-            st.session_state.pending_totp_secret = pyotp.random_base32()
+            pending_map[email] = pyotp.random_base32()
     with c2:
         if current and st.button("Use Existing Secret"):
-            st.session_state.pending_totp_secret = current
+            pending_map[email] = current
 
-    secret = (st.session_state.pending_totp_secret or current or "").strip()
+    # Keep temporary secret scoped per admin email to avoid cross-admin mixups.
+    secret = (pending_map.get(email, "") or current or "").strip().replace(" ", "").upper()
     if not secret:
         st.info("No OTP secret exists yet. Generate a new one.")
         return
@@ -1861,15 +1881,21 @@ def show_admin_dashboard(store, mailer) -> None:
 
     left_actions, _ = st.columns([2.6, 7.4], gap="small")
     with left_actions:
-        a1, a2 = st.columns([1, 1], gap="small")
+        a1, a2, a3 = st.columns([1, 1, 1], gap="small")
         with a1:
             refresh_clicked = st.button("Refresh Data")
         with a2:
             connection_check_clicked = st.button("Check Airtable Access")
+        with a3:
+            email_check_clicked = st.button("Check Email Connection")
 
     if connection_check_clicked:
         success, ok_messages, error_messages = check_airtable_connection(store)
         show_airtable_connection_dialog(success, ok_messages, error_messages)
+
+    if email_check_clicked:
+        success, message = check_smtp_connection(store.config)
+        show_email_connection_dialog(success, message)
 
     if refresh_clicked:
         st.rerun()

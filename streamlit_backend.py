@@ -1432,6 +1432,32 @@ def get_mailer(store: AccessStore | None = None) -> Mailer:
     actual_store = store or get_store()
     return Mailer(actual_store)
 
+
+def check_smtp_connection(config: AppConfig | None = None) -> tuple[bool, str]:
+    cfg = config or AppConfig.from_env()
+    if not cfg.smtp_host or not cfg.smtp_user or not cfg.smtp_pass:
+        return False, "SMTP configuration is incomplete (host/user/pass required)."
+    try:
+        if cfg.smtp_secure:
+            with smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, timeout=20) as server:
+                server.login(cfg.smtp_user, cfg.smtp_pass)
+        else:
+            with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=20) as server:
+                server.starttls()
+                server.login(cfg.smtp_user, cfg.smtp_pass)
+        return (
+            True,
+            f"SMTP login OK: host={cfg.smtp_host}, port={cfg.smtp_port}, secure={cfg.smtp_secure}, "
+            f"user={cfg.smtp_user}",
+        )
+    except Exception as err:
+        return (
+            False,
+            f"SMTP login failed: host={cfg.smtp_host}, port={cfg.smtp_port}, secure={cfg.smtp_secure}, "
+            f"user={cfg.smtp_user}, error={err}",
+        )
+
+
 def is_totp_valid(secret: str, code: str) -> bool:
     if not secret:
         return False
